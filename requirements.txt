@@ -4,3 +4,4 @@ python-dotenv
 google-genai
 tavily-python
 pydantic
+langgraph
