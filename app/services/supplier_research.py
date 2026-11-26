@@ -1,5 +1,6 @@
 import logging
 import time
+from urllib.parse import urlparse
 
 from google import genai
 from google.genai import types
@@ -26,6 +27,7 @@ def generate_with_retry(client, prompt):
     for attempt in range(3):
 
         try:
+
             logger.info(
                 "Gemini attempt %s/3",
                 attempt + 1
@@ -57,43 +59,60 @@ def generate_with_retry(client, prompt):
 
 
 # --------------------------------
-# STEP 2: Tavily fallback
+# STEP 2: URL validation
 # --------------------------------
 
-def create_fallback_suppliers(sources):
+def is_valid_url(url):
 
-    fallback_suppliers = []
+    if not url:
+        return False
 
-    for item in sources:
+    try:
 
-        title = item.get("title", "").strip()
-        url = item.get("url", "").strip()
-        content = item.get("content", "").strip()
+        parsed = urlparse(url)
 
-        if not title or not url:
-            continue
-
-        fallback_suppliers.append(
-            SupplierProfile(
-                supplier_name=title,
-                website=None,
-                description=(
-                    "Unverified search candidate. "
-                    "Gemini extraction was unavailable. "
-                    + content[:300]
-                ),
-                products_services=[],
-                certifications=[],
-                location=None,
-                source_urls=[url]
-            )
+        return (
+            parsed.scheme in ("http", "https")
+            and bool(parsed.netloc)
         )
 
-    return fallback_suppliers
+    except Exception:
+
+        return False
 
 
 # --------------------------------
-# STEP 3: Main supplier research
+# STEP 3: Conservative fallback
+# --------------------------------
+
+def create_fallback_suppliers(
+    sources,
+    product_or_service,
+    location
+):
+
+    """
+    Do not convert arbitrary search-result titles
+    into supplier names.
+
+    Without Gemini extraction, return no supplier
+    profiles rather than misleading users.
+    """
+
+    logger.warning(
+        "Gemini unavailable. Raw Tavily results "
+        "will not be presented as verified suppliers. "
+        "Product=%s Location=%s Sources=%s",
+        product_or_service,
+        location,
+        len(sources)
+    )
+
+    return []
+
+
+# --------------------------------
+# STEP 4: Main supplier research
 # --------------------------------
 
 def research_suppliers(
@@ -113,8 +132,8 @@ def research_suppliers(
     # Prepare search query
 
     search_query = (
-        f"suppliers or manufacturers of "
-        f"{product_or_service} in {location}"
+        f"{product_or_service} manufacturers suppliers "
+        f"dealers in {location}, India"
     )
 
     # Tavily search
@@ -125,7 +144,7 @@ def research_suppliers(
 
     search_data = tavily.search(
         query=search_query,
-        search_depth="basic",
+        search_depth="advanced",
         max_results=max_results
     )
 
@@ -139,50 +158,76 @@ def research_suppliers(
             sources_found=0
         )
 
-    # Prepare sources
+    # Prepare search evidence
 
     sources = []
 
     for result in results:
 
+        title = result.get("title", "").strip()
+        url = result.get("url", "").strip()
+        content = result.get("content", "").strip()
+
+        if not title or not is_valid_url(url):
+            continue
+
         sources.append({
-            "title": result.get("title", ""),
-            "url": result.get("url", ""),
-            "content": result.get("content", "")[:1500]
+            "title": title,
+            "url": url,
+            "content": content[:1500]
         })
 
     allowed_urls = {
         item["url"]
         for item in sources
-        if item["url"]
     }
+
+    if not sources:
+
+        return SupplierResearchResponse(
+            search_query=search_query,
+            suppliers=[],
+            sources_found=0
+        )
 
     # Prepare Gemini prompt
 
     prompt = f"""
-    You are a procurement supplier research assistant.
+You are an experienced procurement supplier
+research assistant.
 
-    Extract supplier information using ONLY the
-    provided search results.
+Your task is to identify genuine companies
+that supply the requested product or service.
 
-    Product: {product_or_service}
-    Location: {location}
+PRODUCT: {product_or_service}
 
-    Instructions:
+TARGET LOCATION: {location}, India
 
-    1. Extract actual supplier names.
-    2. Extract available products and services.
-    3. Extract certifications only when mentioned.
-    4. Include supplier websites only when supported.
-    5. Use only URLs provided in search results.
-    6. Do not invent information.
-    7. Leave unavailable information empty.
+Use ONLY the supplied search evidence.
 
-    Search Results:
-    {sources}
-    """
+STRICT INSTRUCTIONS:
 
-    # Gemini client
+1. Extract actual company or supplier names.
+2. Do not use article titles as supplier names.
+3. Do not use directory names as supplier names.
+4. Do not use advertisements as supplier names.
+5. Do not use headings or generic phrases as company names.
+6. Prefer suppliers operating in the requested location.
+7. Include a supplier only when its identity is
+   explicitly supported by the evidence.
+8. Product relevance must be supported by the evidence.
+9. Never invent websites, locations or certifications.
+10. Only include source URLs supplied below.
+11. If no genuine supplier can be identified,
+    return an empty suppliers list.
+12. Do not manufacture results to reach a target count.
+
+SEARCH EVIDENCE:
+
+{sources}
+"""
+
+    # Initialize Gemini
 
     client = genai.Client(
         api_key=settings.GEMINI_API_KEY
@@ -199,49 +244,24 @@ def research_suppliers(
 
     except Exception as error:
 
-      status_code = getattr(error, "code", None)
-
-    if status_code not in (429, 503):
-        raise
-
-    logger.warning(
-        "Gemini unavailable (HTTP %s). "
-        "Using Tavily fallback.",
-        status_code
-    )
-
-    fallback_suppliers = create_fallback_suppliers(sources)
-
-    return SupplierResearchResponse(
-        search_query=search_query,
-        suppliers=fallback_suppliers,
-        sources_found=len(allowed_urls)
-    )
-
-    logger.warning(
-            "Gemini unavailable after retries. "
-            "Switching to Tavily fallback."
+        status_code = (
+            getattr(error, "code", None)
+            or getattr(error, "status_code", None)
         )
 
-    fallback_suppliers = create_fallback_suppliers(
-            sources
-        )
-
-    return SupplierResearchResponse(
-            search_query=search_query,
-            suppliers=fallback_suppliers,
-            sources_found=len(allowed_urls)
-        )
-
-    if not response.text:
+        if status_code not in (429, 503):
+            raise
 
         logger.warning(
-            "Gemini returned empty response. "
-            "Switching to Tavily fallback."
+            "Gemini unavailable (HTTP %s). "
+            "Using conservative fallback.",
+            status_code
         )
 
         fallback_suppliers = create_fallback_suppliers(
-            sources
+            sources,
+            product_or_service,
+            location
         )
 
         return SupplierResearchResponse(
@@ -250,13 +270,27 @@ def research_suppliers(
             sources_found=len(allowed_urls)
         )
 
-    # Validate Gemini response
+    # Handle empty Gemini response
+
+    if not response or not response.text:
+
+        logger.warning(
+            "Gemini returned an empty response."
+        )
+
+        return SupplierResearchResponse(
+            search_query=search_query,
+            suppliers=[],
+            sources_found=len(allowed_urls)
+        )
+
+    # Validate structured response
 
     extracted = SupplierExtraction.model_validate_json(
         response.text
     )
 
-    # Remove duplicates and unsupported names
+    # Validate extracted suppliers
 
     unique_suppliers = {}
 
@@ -272,10 +306,16 @@ def research_suppliers(
         if not name:
             continue
 
+        # Supplier name must be supported by evidence
+
         if name.casefold() not in search_text:
+            logger.warning(
+                "Discarding unsupported supplier: %s",
+                name
+            )
             continue
 
-        # Keep only URLs returned by Tavily
+        # Validate source URLs
 
         supplier.source_urls = [
             url
@@ -283,16 +323,36 @@ def research_suppliers(
             if url in allowed_urls
         ]
 
+        # Require at least one supporting source
+
+        if not supplier.source_urls:
+            logger.warning(
+                "Discarding supplier without supporting URL: %s",
+                name
+            )
+            continue
+
+        # Remove duplicates
+
         key = name.casefold()
 
         if key not in unique_suppliers:
 
             unique_suppliers[key] = supplier
 
-    # Return final response
+    final_suppliers = list(
+        unique_suppliers.values()
+    )[:max_results]
+
+    logger.info(
+        "Supplier research completed. "
+        "Sources=%s, Suppliers extracted=%s",
+        len(allowed_urls),
+        len(final_suppliers)
+    )
 
     return SupplierResearchResponse(
         search_query=search_query,
-        suppliers=list(unique_suppliers.values()),
+        suppliers=final_suppliers,
         sources_found=len(allowed_urls)
     )
